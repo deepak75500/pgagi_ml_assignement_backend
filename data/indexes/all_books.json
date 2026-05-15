@@ -1,0 +1,21 @@
+{
+  "role": "AI/ML Engineer",
+  "storage_key": "all_books",
+  "source_hash": "1e6579b52a01491aa40afba3889df42e990166e2c46297fc32e685a3f10af823",
+  "source_files": [
+    "2019BurkovTheHundred-pageMachineLearning.pdf",
+    "Artificial Intelligence, Machine Learning, and Deep Learning.pdf",
+    "Bishop-Pattern-Recognition-and-Machine-Learning-2006.pdf",
+    "Introduction to Machine Learning with Python ( PDFDrive.com )-min.pdf",
+    "Machine Learning For Absolute Beginners.pdf",
+    "MachineLearningTomMitchell.pdf",
+    "Master Machine Learning Algorithms - Discover how they work and Implement Them From Scratch by Jason Brownlee (z-lib.org).pdf"
+  ],
+  "chunks": 11615,
+  "embedding_model": "all-MiniLM-L6-v2",
+  "use_sentence_transformers": "auto",
+  "chunk_size": 600,
+  "chunk_overlap": 120,
+  "book_selection_strategy": "all",
+  "built_at": 1778774112.486002
+}
