@@ -92,23 +92,6 @@ app.add_middleware(
 )
 
 
-@app.options("/{full_path:path}")
-async def preflight_handler(request: Request, full_path: str):
-    """Handle CORS preflight for all routes."""
-    origin = request.headers.get("origin", "*")
-    allow_origin = origin if allow_all_origins else (
-        origin if origin in cors_origins else (cors_origins[0] if cors_origins else "*")
-    )
-    return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin":  allow_origin,
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Max-Age": "3600",
-        }
-    )
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────
