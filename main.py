@@ -55,25 +55,37 @@ logging.basicConfig(
 logger = logging.getLogger("pgagi.main")
 
 
-def _env_list(name: str, default: List[str]) -> List[str]:
-    raw = os.getenv(name)
+# ── CORS Helper ────────────────────────────────────────────────────────────────
+
+def _get_cors_origins() -> List[str]:
+    """
+    Build the CORS allow-list from the CORS_ORIGINS env var.
+    Falls back to the hardcoded Vercel frontend URL so the app works
+    even when the env var is missing, empty, or whitespace-only.
+
+    Set CORS_ORIGINS to "*" in Render to allow all origins (handy during debug).
+    Set CORS_ORIGINS to a comma-separated list for multiple explicit origins.
+    """
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+
     if not raw:
-        return default
-    values = [item.strip() for item in raw.split(",") if item.strip()]
-    return values or default
+        # Env var absent or blank — use safe default
+        origins = ["https://pgagimlassignementfrontend14.vercel.app"]
+        logger.info("CORS_ORIGINS not set; using default: %s", origins)
+        return origins
+
+    if raw == "*":
+        logger.warning("CORS_ORIGINS=* — all origins allowed (not recommended for production)")
+        return ["*"]
+
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    if not origins:
+        origins = ["https://pgagimlassignementfrontend14.vercel.app"]
+    logger.info("CORS origins loaded from env: %s", origins)
+    return origins
 
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
-
-# ── CORS Setup ────────────────────────────────────────────────────────────────
-
-# ── CORS Setup ────────────────────────────────────────────────────────────────
-
-cors_origins = _env_list("CORS_ORIGINS", [
-    "https://pgagimlassignementfrontend14.vercel.app"
-])
-
-
 
 app = FastAPI(
     title="PGAGI AI Screening System",
@@ -83,15 +95,39 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+cors_origins = _get_cors_origins()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Content-Length"],
+    max_age=600,   # cache preflight for 10 minutes
 )
 
 
+# ── Explicit OPTIONS catch-all (safety net for reverse-proxy stripping headers) ─
+
+@app.options("/{rest_of_path:path}")
+async def global_options_handler(rest_of_path: str, request: Request):
+    """
+    Catch-all OPTIONS handler.  FastAPI's CORSMiddleware should handle preflight
+    automatically, but some reverse-proxy / CDN setups (e.g. Render's edge layer)
+    can swallow the middleware response.  This ensures a 200 is always returned.
+    """
+    origin = request.headers.get("origin", "*")
+    allowed = cors_origins if cors_origins != ["*"] else [origin]
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin":  origin if (origin in allowed or "*" in allowed) else "",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age":       "600",
+        },
+    )
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────
@@ -100,16 +136,19 @@ app.add_middleware(
 async def startup():
     """Initialise DB and pre-load knowledge base embeddings."""
     logger.info("Starting PGAGI AI Screening System v1.2.0 ...")
+    logger.info("CORS origins: %s", cors_origins)
     sm.initialize_db()
 
-    roles_to_ingest = _env_list("STARTUP_INGEST_ROLES", [role.value for role in JobRole])
+    raw_roles  = os.getenv("STARTUP_INGEST_ROLES", "").strip()
+    roles_list = [r.strip() for r in raw_roles.split(",") if r.strip()] if raw_roles else [role.value for role in JobRole]
+
     if rag.AUTO_INGEST_ON_STARTUP:
         logger.info("Ensuring startup embeddings for %d role(s) from %s",
-                    len(roles_to_ingest), rag.BOOKS_DIR)
+                    len(roles_list), rag.BOOKS_DIR)
         loop = asyncio.get_running_loop()
         app.state.kb_startup_status = await loop.run_in_executor(
             None,
-            lambda: rag.ingest_books_for_roles(roles_to_ingest, force=rag.REBUILD_INDEX_ON_STARTUP),
+            lambda: rag.ingest_books_for_roles(roles_list, force=rag.REBUILD_INDEX_ON_STARTUP),
         )
         logger.info("Startup KB status: %s", app.state.kb_startup_status)
     else:
@@ -184,17 +223,17 @@ async def ingest_status():
         except Exception:
             current = False
         result[role.value] = {
-            "built":   kb.is_built(),
-            "loaded":  kb.index is not None,
-            "chunks":  len(kb.chunks) if kb.chunks else 0,
-            "current": current,
+            "built":       kb.is_built(),
+            "loaded":      kb.index is not None,
+            "chunks":      len(kb.chunks) if kb.chunks else 0,
+            "current":     current,
             "storage_key": kb.storage_key,
-            "sources": manifest.get("source_files", []),
+            "sources":     manifest.get("source_files", []),
         }
     return {
-        "books_dir": str(rag.BOOKS_DIR),
+        "books_dir":             str(rag.BOOKS_DIR),
         "auto_ingest_on_startup": rag.AUTO_INGEST_ON_STARTUP,
-        "knowledge_bases": result,
+        "knowledge_bases":       result,
     }
 
 
@@ -285,8 +324,10 @@ async def upload_resume(
     allowed = {".pdf", ".doc", ".docx", ".txt", ".text", ".md"}
     suffix  = Path(file.filename or "resume.pdf").suffix.lower()
     if suffix not in allowed:
-        raise HTTPException(status_code=400,
-                            detail=f"File type '{suffix}' not supported. Use PDF, DOC, DOCX, TXT, or MD.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{suffix}' not supported. Use PDF, DOC, DOCX, TXT, or MD.",
+        )
 
     try:
         file_bytes = await file.read()
@@ -311,11 +352,11 @@ async def upload_resume(
     _queue_question_generation(background_tasks, session_id, session, resume_analysis)
 
     return {
-        "session_id":    session_id,
-        "resume_parsed": True,
-        "analysis":      resume_analysis.model_dump(),
+        "session_id":        session_id,
+        "resume_parsed":     True,
+        "analysis":          resume_analysis.model_dump(),
         "generation_status": QuestionGenerationStatus.GENERATING.value,
-        "message": "Resume parsed. Questions are being generated; poll GET /question.",
+        "message":           "Resume parsed. Questions are being generated; poll GET /question.",
     }
 
 
@@ -334,28 +375,24 @@ async def upload_resume_text(
         raise HTTPException(status_code=400, detail="Session is not active.")
 
     try:
-        # main.py — upload_resume_text endpoint
         text = request.resume_text.strip()
-        logger.error("Pasted resume text: %s", text)
-        if len(text) < 150:                          # ← was 20, raise to 150+
+        logger.info("Pasted resume received: session=%s chars=%d", request.session_id, len(text))
+        if len(text) < 150:
             raise HTTPException(
                 status_code=422,
                 detail=(
                     f"Resume text is too short ({len(text)} characters). "
                     "Please paste your full resume — minimum 150 characters required."
-                )
+                ),
             )
-                
-        logger.info(
-            "Pasted resume received: session=%s filename=%s chars=%d",
-            request.session_id, request.filename, len(text),
-        )
         resume_analysis = await rp.parse_resume_async(
             text.encode("utf-8"),
             request.filename or "pasted-resume.txt",
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Pasted resume parsing failed for session %s: %s", request.session_id, e)
         raise HTTPException(status_code=500, detail=f"Resume parsing failed: {e}")
@@ -364,11 +401,11 @@ async def upload_resume_text(
     _queue_question_generation(background_tasks, request.session_id, session, resume_analysis)
 
     return {
-        "session_id":    request.session_id,
-        "resume_parsed": True,
-        "analysis":      resume_analysis.model_dump(),
+        "session_id":        request.session_id,
+        "resume_parsed":     True,
+        "analysis":          resume_analysis.model_dump(),
         "generation_status": QuestionGenerationStatus.GENERATING.value,
-        "message": "Resume text parsed. Questions are being generated; poll GET /question.",
+        "message":           "Resume text parsed. Questions are being generated; poll GET /question.",
     }
 
 
@@ -505,7 +542,7 @@ async def submit_answer(
         "total":             len(session.questions),
         "is_last_question":  is_last,
         "evaluation_status": "processing",
-        "message": "Answer saved. Evaluation is processing — check GET /evaluation for result.",
+        "message":           "Answer saved. Evaluation is processing — check GET /evaluation for result.",
     }
 
 
@@ -598,7 +635,6 @@ async def complete_session(session_id: str):
         await asyncio.sleep(1.5)
 
     session = sm.get_session(session_id)
-
     return await _generate_and_store_summary(session_id, session)
 
 
@@ -611,7 +647,7 @@ async def get_session_summary(session_id: str):
     if session.status != SessionStatus.COMPLETED:
         raise HTTPException(
             status_code=400,
-            detail="Session is not yet completed. Call POST /complete first."
+            detail="Session is not yet completed. Call POST /complete first.",
         )
 
     saved_summary = sm.get_saved_session_summary(session_id)
@@ -638,7 +674,6 @@ async def download_session_pdf(session_id: str):
         if not export_data:
             raise HTTPException(status_code=404, detail="Could not export session data.")
 
-        # Run PDF generation in executor to avoid blocking the event loop
         loop = asyncio.get_running_loop()
         pdf_bytes = await loop.run_in_executor(None, lambda: generate_summary_pdf(export_data))
 
@@ -649,14 +684,14 @@ async def download_session_pdf(session_id: str):
             media_type="application/pdf",
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(pdf_bytes)),
-            }
+                "Content-Length":      str(len(pdf_bytes)),
+            },
         )
     except HTTPException:
         raise
     except Exception as e:
         logger.error("PDF generation failed for session %s: %s", session_id, e)
-        raise HTTPException(status_code=500, detail=f"PDF generation failed1233232: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
 
 
 # ── Session Management ────────────────────────────────────────────────────────
@@ -728,7 +763,7 @@ async def get_available_roles():
 # ── Global Exception Handler ───────────────────────────────────────────────────
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
+async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled exception on %s: %s", request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=500,
