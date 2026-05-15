@@ -65,14 +65,21 @@ def _env_list(name: str, default: List[str]) -> List[str]:
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
 
+# ── CORS Setup ────────────────────────────────────────────────────────────────
+
+# ── CORS Setup ────────────────────────────────────────────────────────────────
+
 cors_origins = _env_list("CORS_ORIGINS", [
-    "http://127.0.0.1:5500",
-    "http://localhost:5500",
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-    "http://127.0.0.1:3001",
-    "http://localhost:3001",
+    "https://pgagimlassignementfrontend14.vercel.app"
 ])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app = FastAPI(
     title="PGAGI AI Screening System",
@@ -82,18 +89,7 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-is_production  = os.getenv("ENVIRONMENT", "development").lower() == "production"
-allow_all_origins = not is_production and os.getenv("CORS_ALLOW_ALL", "true").lower() == "true"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if allow_all_origins else cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=3600,
-)
 
 
 @app.options("/{full_path:path}")
