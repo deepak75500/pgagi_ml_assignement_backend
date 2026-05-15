@@ -84,10 +84,11 @@ EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "all-MiniLM-L6-v2")
 CHUNK_SIZE       = 600   # characters — balances context richness vs retrieval noise
 CHUNK_OVERLAP    = 120   # ~20% overlap to preserve cross-boundary context
 TOP_K_RETRIEVE   = 6     # chunks retrieved per query
-BASE_DIR         = Path(__file__).resolve().parents[1]
-DATA_DIR         = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
-INDEX_DIR        = Path(os.getenv("INDEX_DIR", DATA_DIR / "indexes"))
-BOOKS_DIR        = Path(os.getenv("BOOKS_DIR", DATA_DIR / "books"))
+BASE_DIR = Path(__file__).resolve().parent
+
+DATA_DIR  = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
+INDEX_DIR = Path(os.getenv("INDEX_DIR", DATA_DIR / "indexes"))
+BOOKS_DIR = Path(os.getenv("BOOKS_DIR", DATA_DIR / "books"))
 ALLOW_CROSS_ROLE_BOOK_FALLBACK = os.getenv("ALLOW_CROSS_ROLE_BOOK_FALLBACK", "false").lower() == "true"
 USE_SENTENCE_TRANSFORMERS = os.getenv("USE_SENTENCE_TRANSFORMERS", "auto").lower()
 CHUNK_SIZE = _env_int("CHUNK_SIZE", CHUNK_SIZE)
