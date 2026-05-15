@@ -73,13 +73,7 @@ cors_origins = _env_list("CORS_ORIGINS", [
     "https://pgagimlassignementfrontend14.vercel.app"
 ])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
 
 app = FastAPI(
     title="PGAGI AI Screening System",
@@ -89,7 +83,13 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.options("/{full_path:path}")
