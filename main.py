@@ -31,6 +31,8 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import uvicorn
 
 # Internal modules
@@ -69,7 +71,6 @@ def _get_cors_origins() -> List[str]:
     raw = os.getenv("CORS_ORIGINS", "").strip()
 
     if not raw:
-        # Env var absent or blank — use safe default
         origins = ["https://pgagimlassignementfrontend14.vercel.app"]
         logger.info("CORS_ORIGINS not set; using default: %s", origins)
         return origins
@@ -104,28 +105,97 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition", "Content-Length"],
-    max_age=600,   # cache preflight for 10 minutes
+    max_age=600,
 )
 
 
-# ── Explicit OPTIONS catch-all (safety net for reverse-proxy stripping headers) ─
+# ── CORS header helper (used by all exception handlers) ───────────────────────
+
+def _cors_headers(request: Request) -> dict:
+    """
+    Return the Access-Control-Allow-Origin header for the request's origin.
+    FastAPI's CORSMiddleware does NOT add this header to error responses that
+    are returned by exception handlers — so we have to do it manually here.
+    Without it, the browser sees a CORS violation on any 4xx / 5xx response
+    and hides the real error message from the developer console.
+    """
+    origin = request.headers.get("origin", "")
+    if not origin:
+        return {}
+    is_allowed = "*" in cors_origins or origin in cors_origins
+    if not is_allowed:
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "false",
+        "Vary": "Origin",
+    }
+
+
+# ── Exception handlers (must be registered BEFORE routes) ─────────────────────
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Attach CORS headers to every HTTPException (404, 400, 409, etc.)."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=_cors_headers(request),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Pydantic validation failures (wrong field types, missing fields, bad enum values).
+    These are 422s and are the most common cause of the 'CORS error on /session/start'
+    symptom — the enum value sent by the frontend doesn't match JobRole exactly.
+    """
+    logger.warning(
+        "Validation error on %s %s: %s",
+        request.method, request.url.path, exc.errors(),
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+        headers=_cors_headers(request),
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all for unhandled exceptions — always includes CORS headers."""
+    logger.error(
+        "Unhandled exception on %s %s: %s",
+        request.method, request.url.path, exc,
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred.", "error": str(exc)},
+        headers=_cors_headers(request),
+    )
+
+
+# ── Explicit OPTIONS catch-all ─────────────────────────────────────────────────
 
 @app.options("/{rest_of_path:path}")
 async def global_options_handler(rest_of_path: str, request: Request):
     """
-    Catch-all OPTIONS handler.  FastAPI's CORSMiddleware should handle preflight
-    automatically, but some reverse-proxy / CDN setups (e.g. Render's edge layer)
-    can swallow the middleware response.  This ensures a 200 is always returned.
+    Catch-all OPTIONS handler. CORSMiddleware handles preflight automatically
+    but some reverse-proxy / CDN setups (e.g. Render's edge layer) can swallow
+    the middleware response. This ensures a 200 is always returned.
     """
-    origin = request.headers.get("origin", "*")
-    allowed = cors_origins if cors_origins != ["*"] else [origin]
+    origin = request.headers.get("origin", "")
+    is_allowed = "*" in cors_origins or origin in cors_origins
     return Response(
         status_code=200,
         headers={
-            "Access-Control-Allow-Origin":  origin if (origin in allowed or "*" in allowed) else "",
+            "Access-Control-Allow-Origin":  origin if is_allowed else "",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Max-Age":       "600",
+            "Vary":                         "Origin",
         },
     )
 
@@ -137,20 +207,39 @@ async def startup():
     """Initialise DB and pre-load knowledge base embeddings."""
     logger.info("Starting PGAGI AI Screening System v1.2.0 ...")
     logger.info("CORS origins: %s", cors_origins)
-    sm.initialize_db()
 
+    # ── DB init — crash here is fatal but should be visible in Render logs ──
+    try:
+        sm.initialize_db()
+        logger.info("Database initialised successfully.")
+    except Exception as e:
+        # Log and continue — routes will fail gracefully with 503 rather than
+        # the whole process dying silently and serving zero-header 500s.
+        logger.error("Database initialisation failed: %s", e, exc_info=True)
+
+    # ── KB ingestion ────────────────────────────────────────────────────────
     raw_roles  = os.getenv("STARTUP_INGEST_ROLES", "").strip()
-    roles_list = [r.strip() for r in raw_roles.split(",") if r.strip()] if raw_roles else [role.value for role in JobRole]
+    roles_list = (
+        [r.strip() for r in raw_roles.split(",") if r.strip()]
+        if raw_roles
+        else [role.value for role in JobRole]
+    )
 
     if rag.AUTO_INGEST_ON_STARTUP:
-        logger.info("Ensuring startup embeddings for %d role(s) from %s",
-                    len(roles_list), rag.BOOKS_DIR)
-        loop = asyncio.get_running_loop()
-        app.state.kb_startup_status = await loop.run_in_executor(
-            None,
-            lambda: rag.ingest_books_for_roles(roles_list, force=rag.REBUILD_INDEX_ON_STARTUP),
+        logger.info(
+            "Ensuring startup embeddings for %d role(s) from %s",
+            len(roles_list), rag.BOOKS_DIR,
         )
-        logger.info("Startup KB status: %s", app.state.kb_startup_status)
+        try:
+            loop = asyncio.get_running_loop()
+            app.state.kb_startup_status = await loop.run_in_executor(
+                None,
+                lambda: rag.ingest_books_for_roles(roles_list, force=rag.REBUILD_INDEX_ON_STARTUP),
+            )
+            logger.info("Startup KB status: %s", app.state.kb_startup_status)
+        except Exception as e:
+            logger.error("KB startup ingestion failed (non-fatal): %s", e, exc_info=True)
+            app.state.kb_startup_status = {}
     else:
         app.state.kb_startup_status = {}
         for role in JobRole:
@@ -158,7 +247,9 @@ async def startup():
             if kb.is_built():
                 try:
                     kb.load()
-                    logger.info("Pre-loaded KB for role: %s (%d chunks)", role.value, len(kb.chunks))
+                    logger.info(
+                        "Pre-loaded KB for role: %s (%d chunks)", role.value, len(kb.chunks)
+                    )
                 except Exception as e:
                     logger.warning("Could not pre-load KB for %s: %s", role.value, e)
 
@@ -231,9 +322,9 @@ async def ingest_status():
             "sources":     manifest.get("source_files", []),
         }
     return {
-        "books_dir":             str(rag.BOOKS_DIR),
+        "books_dir":              str(rag.BOOKS_DIR),
         "auto_ingest_on_startup": rag.AUTO_INGEST_ON_STARTUP,
-        "knowledge_bases":       result,
+        "knowledge_bases":        result,
     }
 
 
@@ -242,21 +333,33 @@ async def ingest_status():
 @app.post("/api/session/start", tags=["Session"])
 async def start_session(request: StartSessionRequest):
     """Create a new interview session."""
-    kb = rag.get_kb(request.role.value)
+    # Validate role & KB — gives a clear 400 instead of an opaque 500
     try:
+        kb = rag.get_kb(request.role.value)
         kb_current = kb.is_current()
-    except Exception:
+    except Exception as e:
+        logger.warning("KB check failed for role %s: %s", request.role.value, e)
         kb_current = False
+
     if not kb_current:
         logger.warning(
             "Session started for role '%s' before KB was current.", request.role.value
         )
 
-    session_id = sm.create_session(
-        candidate_name=request.candidate_name,
-        role=request.role.value,
-        total_questions=request.total_questions,
-    )
+    # Create session — wraps DB errors so they surface with CORS headers
+    try:
+        session_id = sm.create_session(
+            candidate_name=request.candidate_name,
+            role=request.role.value,
+            total_questions=request.total_questions,
+        )
+    except Exception as e:
+        logger.error("create_session failed: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database unavailable — could not create session: {e}",
+        )
+
     return {
         "session_id":      session_id,
         "candidate_name":  request.candidate_name,
@@ -268,13 +371,21 @@ async def start_session(request: StartSessionRequest):
     }
 
 
-def _queue_question_generation(background_tasks: BackgroundTasks, session_id: str, session, resume_analysis):
+def _queue_question_generation(
+    background_tasks: BackgroundTasks,
+    session_id: str,
+    session,
+    resume_analysis,
+):
     """Start async RAG question generation after resume parsing succeeds."""
+
     async def _generate_and_save():
         try:
             sm.set_question_generation_status(session_id, QuestionGenerationStatus.GENERATING)
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: rag.ingest_books_for_role(session.role))
+            await loop.run_in_executor(
+                None, lambda: rag.ingest_books_for_role(session.role)
+            )
 
             questions_data = await rag.generate_questions(
                 role=session.role,
@@ -298,7 +409,9 @@ def _queue_question_generation(background_tasks: BackgroundTasks, session_id: st
                 for q in questions_data
             ]
             sm.save_questions(session_id, question_models)
-            logger.info("Questions generated for session %s (%d Qs)", session_id, len(question_models))
+            logger.info(
+                "Questions generated for session %s (%d Qs)", session_id, len(question_models)
+            )
         except Exception as e:
             logger.error("Question generation failed for session %s: %s", session_id, e)
             sm.set_question_generation_status(
@@ -339,7 +452,9 @@ async def upload_resume(
             "Resume upload received: session=%s filename=%s type=%s bytes=%d",
             session_id, file.filename, suffix, len(file_bytes),
         )
-        resume_analysis = await rp.parse_resume_async(file_bytes, file.filename or "resume.pdf")
+        resume_analysis = await rp.parse_resume_async(
+            file_bytes, file.filename or "resume.pdf"
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except HTTPException:
@@ -376,7 +491,9 @@ async def upload_resume_text(
 
     try:
         text = request.resume_text.strip()
-        logger.info("Pasted resume received: session=%s chars=%d", request.session_id, len(text))
+        logger.info(
+            "Pasted resume received: session=%s chars=%d", request.session_id, len(text)
+        )
         if len(text) < 150:
             raise HTTPException(
                 status_code=422,
@@ -394,7 +511,9 @@ async def upload_resume_text(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Pasted resume parsing failed for session %s: %s", request.session_id, e)
+        logger.error(
+            "Pasted resume parsing failed for session %s: %s", request.session_id, e
+        )
         raise HTTPException(status_code=500, detail=f"Resume parsing failed: {e}")
 
     sm.update_session_resume(request.session_id, resume_analysis)
@@ -493,7 +612,9 @@ async def submit_answer(
     if session.question_generation_status != QuestionGenerationStatus.READY or not session.questions:
         raise HTTPException(status_code=409, detail="Questions are not ready yet.")
 
-    question = next((q for q in session.questions if q.question_id == request.question_id), None)
+    question = next(
+        (q for q in session.questions if q.question_id == request.question_id), None
+    )
     if not question:
         raise HTTPException(status_code=404, detail="Question not found in this session.")
 
@@ -511,7 +632,9 @@ async def submit_answer(
     if request.question_id in answered_ids:
         raise HTTPException(status_code=409, detail="This question has already been answered.")
 
-    sm.save_answer(session_id, request.question_id, request.answer, request.time_taken_seconds)
+    sm.save_answer(
+        session_id, request.question_id, request.answer, request.time_taken_seconds
+    )
 
     async def _evaluate():
         try:
@@ -525,8 +648,10 @@ async def submit_answer(
                 follow_up_question   = eval_data.get("follow_up_question"),
             )
             sm.save_evaluation(session_id, evaluation)
-            logger.info("Evaluation saved — session=%s Q=%s score=%.1f",
-                        session_id[:8], request.question_id[:8], evaluation.score)
+            logger.info(
+                "Evaluation saved — session=%s Q=%s score=%.1f",
+                session_id[:8], request.question_id[:8], evaluation.score,
+            )
         except Exception as e:
             logger.error("Evaluation failed for Q %s: %s", request.question_id, e)
 
@@ -553,11 +678,15 @@ async def get_evaluation(session_id: str, question_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    question = next((q for q in session.questions if q.question_id == question_id), None)
+    question = next(
+        (q for q in session.questions if q.question_id == question_id), None
+    )
     if not question:
         return {"status": "not_found", "question_id": question_id}
 
-    evaluation = next((e for e in session.evaluations if e.question_id == question_id), None)
+    evaluation = next(
+        (e for e in session.evaluations if e.question_id == question_id), None
+    )
     if not evaluation:
         return {
             "status":      "pending",
@@ -625,13 +754,14 @@ async def complete_session(session_id: str):
 
     sm.complete_session(session_id)
 
-    # Wait for background evaluations — check every 1.5 s, max 15 s
     for _ in range(10):
         session = sm.get_session(session_id)
         if len(session.evaluations) >= len(session.answers):
             break
-        logger.info("Waiting for evaluations: %d/%d done",
-                    len(session.evaluations), len(session.answers))
+        logger.info(
+            "Waiting for evaluations: %d/%d done",
+            len(session.evaluations), len(session.answers),
+        )
         await asyncio.sleep(1.5)
 
     session = sm.get_session(session_id)
@@ -661,10 +791,7 @@ async def get_session_summary(session_id: str):
 
 @app.get("/api/session/{session_id}/download-pdf", tags=["Session"])
 async def download_session_pdf(session_id: str):
-    """
-    Download session summary as a professional PDF report.
-    Includes resume profile, performance metrics, and full Q&A analysis.
-    """
+    """Download session summary as a professional PDF report."""
     session = sm.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -675,7 +802,9 @@ async def download_session_pdf(session_id: str):
             raise HTTPException(status_code=404, detail="Could not export session data.")
 
         loop = asyncio.get_running_loop()
-        pdf_bytes = await loop.run_in_executor(None, lambda: generate_summary_pdf(export_data))
+        pdf_bytes = await loop.run_in_executor(
+            None, lambda: generate_summary_pdf(export_data)
+        )
 
         safe_name = session.candidate_name.replace(" ", "_").replace("/", "-")
         filename  = f"interview-summary-{safe_name}-{session_id[:8]}.pdf"
@@ -698,7 +827,7 @@ async def download_session_pdf(session_id: str):
 
 @app.delete("/api/session/{session_id}", tags=["Session"])
 async def delete_session(session_id: str):
-    """Hard-delete a session and ALL associated data (answers, evaluations, questions)."""
+    """Hard-delete a session and ALL associated data."""
     session = sm.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -712,10 +841,7 @@ async def delete_session(session_id: str):
 
 @app.post("/api/session/{session_id}/reset", tags=["Session"])
 async def reset_session_answers(session_id: str):
-    """
-    Clear all answers and evaluations from a session (keep questions & resume).
-    Allows restarting the interview from question 1.
-    """
+    """Clear all answers and evaluations (keep questions & resume)."""
     session = sm.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
@@ -758,17 +884,6 @@ async def get_available_roles():
             "sources":     manifest.get("source_files", []),
         })
     return {"books_dir": str(rag.BOOKS_DIR), "roles": roles}
-
-
-# ── Global Exception Handler ───────────────────────────────────────────────────
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled exception on %s: %s", request.url.path, exc, exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "An internal server error occurred.", "error": str(exc)},
-    )
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
