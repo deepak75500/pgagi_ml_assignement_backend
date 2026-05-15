@@ -7,7 +7,7 @@ langchain-community
 openai
 pydantic
 sqlite-utils
-
+python-multipart
 # PDF & Document Processing
 reportlab
 PyPDF2
